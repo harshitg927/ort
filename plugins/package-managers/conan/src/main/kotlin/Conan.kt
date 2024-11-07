@@ -30,6 +30,7 @@ import com.charleskorn.kaml.yamlScalar
 
 import java.io.File
 
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -110,7 +111,9 @@ class Conan(
         ) = Conan(type, analysisRoot, analyzerConfig, repoConfig)
     }
 
-    private val conanHome = Os.userHomeDirectory.resolve(".conan")
+    private val isConan1 by lazy { getVersion().startsWith("1.") }
+
+    private val conanHome by lazy { Os.userHomeDirectory.resolve(if (isConan1) ".conan" else ".conan2") }
 
     // This is where Conan caches downloaded packages [1]. Note that the package cache is not concurrent, and its
     // layout does not support packages from different remotes that are named (and versioned) the same.
@@ -119,7 +122,7 @@ class Conan(
     //
     // [1]: https://docs.conan.io/en/latest/reference/config_files/conan.conf.html#storage
     // [2]: https://docs.conan.io/en/latest/configuration/download_cache.html#download-cache
-    private val conanStoragePath = conanHome.resolve("data")
+    private val conanStoragePath by lazy { conanHome.resolve("data") }
 
     private val pkgInspectResults = mutableMapOf<String, JsonObject>()
 
@@ -168,16 +171,39 @@ class Conan(
             val lockfileName = options[OPTION_LOCKFILE_NAME]
             requireLockfile(workingDir) { lockfileName?.let { hasLockfile(workingDir.resolve(it).path) } == true }
 
-            val jsonFile = createOrtTempDir().resolve("info.json")
-            if (lockfileName != null) {
-                verifyLockfileBelongsToProject(workingDir, lockfileName)
-                run(workingDir, "info", definitionFile.name, "-l", lockfileName, "--json", jsonFile.absolutePath)
-            } else {
-                run(workingDir, "info", definitionFile.name, "--json", jsonFile.absolutePath, *DUMMY_COMPILER_SETTINGS)
-            }
+            val pkgInfos = if (isConan1) {
+                val jsonFile = createOrtTempDir().resolve("info.json")
 
-            val pkgInfos = parsePackageInfos(jsonFile)
-            jsonFile.parentFile.safeDeleteRecursively()
+                if (lockfileName != null) {
+                    verifyLockfileBelongsToProject(workingDir, lockfileName)
+                    run(workingDir, "info", definitionFile.name, "-l", lockfileName, "--json", jsonFile.absolutePath)
+                } else {
+                    run(
+                        workingDir,
+                        "info",
+                        definitionFile.name,
+                        "--json",
+                        jsonFile.absolutePath,
+                        *DUMMY_COMPILER_SETTINGS
+                    )
+                }
+
+                parsePackageInfos(jsonFile).also { jsonFile.parentFile.safeDeleteRecursively() }
+            } else {
+                // Create a default build profile.
+                if (!conanHome.resolve("profiles/default").exists()) {
+                    run(workingDir, "profile", "detect")
+                }
+
+                val graphInfo = if (lockfileName != null) {
+                    verifyLockfileBelongsToProject(workingDir, lockfileName)
+                    run(workingDir, "graph", "info", "-f", "json", "-l", lockfileName, definitionFile.name)
+                } else {
+                    run(workingDir, "graph", "info", "-f", "json", *DUMMY_COMPILER_SETTINGS, definitionFile.name)
+                }
+
+                parsePackageInfos(graphInfo.stdout)
+            }
 
             val packageList = removeProjectPackage(pkgInfos, definitionFile.name)
             val packages = parsePackages(packageList, workingDir)
@@ -232,17 +258,23 @@ class Conan(
 
         // List configured remotes in "remotes.txt" format.
         val remoteList = runCatching {
-            run("remote", "list", "--raw")
+            if (isConan1) {
+                // List configured remotes in "remotes.txt" format.
+                run("remote", "list", "--raw")
+            } else {
+                // List configured remotes in JSON format.
+                run("remote", "list", "-f", "json")
+            }
         }.getOrElse {
             logger.warn { "Failed to list remotes." }
             return
         }
 
-        val remotes = parseConanRemoteList(remoteList.stdout)
+        val remotes = if (isConan1) parseConan1RemoteList(remoteList.stdout) else parseConan2RemoteList(remoteList.stdout)
         configureUserAuthentication(remotes)
     }
 
-    private fun parseConanRemoteList(remoteList: String): List<Pair<String, String>> =
+    private fun parseConan1RemoteList(remoteList: String): List<Pair<String, String>> =
         remoteList.lines().mapNotNull { line ->
             // Extract the remote URL.
             val trimmedLine = line.trim()
@@ -258,6 +290,21 @@ class Conan(
 
             remoteName to remoteUrl
         }
+
+    private fun parseConan2RemoteList(remoteList: String) {
+        @Serializable
+        data class Remote(
+            val name: String,
+            val url: String,
+            val verify_ssl: Boolean,
+            val enabled: Boolean
+        )
+
+        val remotes = Json.decodeFromString<List<Remote>>(remoteList)
+        remotes.filter { it.enabled }.forEach {
+            configureUserAuthentication(it.name, it.url)
+        }
+    }
 
     private fun configureUserAuthentication(remotes: List<Pair<String, String>>) =
         remotes.forEach { (remoteName, remoteUrl) ->

@@ -30,7 +30,8 @@ private val JSON = Json {
     namingStrategy = JsonNamingStrategy.SnakeCase
 }
 
-internal fun parsePackageInfos(file: File): List<PackageInfo> = JSON.decodeFromString(file.readText())
+internal fun parsePackageInfos(file: File): List<PackageInfo> = parsePackageInfos(file.readText())
+internal fun parsePackageInfos(json: String): List<PackageInfo> = JSON.decodeFromString(json)
 
 @Serializable
 internal data class PackageInfo(
